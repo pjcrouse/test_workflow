@@ -58,9 +58,9 @@ jobs:
           echo "::notice title=PR Title::$TITLE"
           echo "::notice title=PR Body::$BODY"
 
-      - name: Install gh (GitHub CLI)
-        if: inputs.dry_run == false
-        uses: cli/gh-action-install@v3
+#      - name: Install gh (GitHub CLI)
+#        if: inputs.dry_run == false
+#        uses: cli/gh-action-install@v3
 
       - name: Check if an open dev→main PR already exists
         if: inputs.dry_run == false
