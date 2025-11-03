@@ -1,0 +1,63 @@
+name: Create merge PR to main
+run-name: "Raise merge PR to main from dev ${{ github.sha }}"
+
+on:
+  workflow_call:
+    secrets:
+      GH_PAT:
+        required: true
+
+jobs:
+  create_pr:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # needed to compare commit history
+
+      - name: Fetch main branch
+        run: git fetch origin main
+
+      - name: Extract BOS ticket numbers from commits
+        id: extract_tickets
+        run: |
+          # Collect commit messages between main and dev
+          COMMITS=$(git log origin/main..HEAD --pretty=format:"%s")
+
+          # Extract, normalize, dedupe, and join ticket numbers
+          TICKETS=$(echo "$COMMITS" \
+            | grep -oiE "bos[-_][0-9]+" \
+            | tr '[:lower:]' '[:upper:]' \
+            | sed 's/_/-/g' \
+            | sort -u \
+            | paste -sd "," -)
+          
+          # Fallback if none found
+          if [ -z "$TICKETS" ]; then
+            TICKETS="no-ticket"
+          fi
+
+          echo "tickets=$TICKETS" >> $GITHUB_OUTPUT
+
+      - name: Check if an open dev→main PR already exists
+        id: check_pr
+        run: |
+          OPEN_PRS=$(gh pr list --base main --head dev --json number --jq '.[].number')
+          if [ -n "$OPEN_PRS" ]; then
+            echo "existing_pr=$OPEN_PRS" >> $GITHUB_OUTPUT
+          else
+            echo "existing_pr=" >> $GITHUB_OUTPUT
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+
+      - name: Create PR if none exists
+        if: steps.check_pr.outputs.existing_pr == ''
+        run: |
+          TITLE="Merge dev to main (${{ steps.extract_tickets.outputs.tickets }})"
+          BODY="Triggered by a merge in dev. Now merging dev into main. Includes tickets: ${{ steps.extract_tickets.outputs.tickets }}"
+          gh pr create --base main --head dev --title "$TITLE" --body "$BODY"
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
