@@ -2,17 +2,15 @@ name: Create merge PR to main
 run-name: "Raise merge PR to main from dev ${{ github.sha }}"
 
 on:
-  workflow_call:
-    secrets:
-      GH_PAT:
-        required: true
-  workflow_dispatch:
-    inputs:
-      dry_run:
-        description: "Preview only (no PR creation/updates)"
-        required: false
-        type: boolean
-        default: true
+  # Manual + auto on pushes to dev
+  workflow_dispatch: {}
+  push:
+    branches: [ dev ]
+
+# Prevent overlapping runs from racing each other
+concurrency:
+  group: dev-main-pr
+  cancel-in-progress: true
 
 jobs:
   create_pr:
@@ -33,18 +31,12 @@ jobs:
           git fetch --no-tags origin main
           git fetch --no-tags origin dev
 
-      - name: Extract BOS ticket numbers from commits
+      - name: Extract BOS tickets from dev not in main
         id: extract
         shell: bash
         run: |
-          set -o errexit
-          set -o nounset
-          set -o pipefail
-
-          # Commits on dev but not on main
+          set -euo pipefail
           COMMITS=$(git log origin/main..origin/dev --pretty=format:"%s")
-
-          # Extract, normalize, dedupe, join
           TICKETS=$(
             echo "$COMMITS" \
             | (grep -oiE 'bos[-_][0-9]+' || true) \
@@ -53,87 +45,63 @@ jobs:
             | sort -u \
             | paste -sd ',' -
           )
-
-          # Use heredoc to be robust even if empty or contains odd chars
           {
             echo 'tickets<<EOF'
             echo "$TICKETS"
             echo 'EOF'
           } >> "$GITHUB_OUTPUT"
 
-      - name: Build PR title/body and handle title limit
+      - name: Build PR title/body (cap at 256 chars; prepare comment if needed)
         id: compose
         shell: bash
         run: |
-          set -o errexit
-          set -o nounset
-          set -o pipefail
-
+          set -euo pipefail
+          BASE="Merge dev to main"
           TICKETS="${{ steps.extract.outputs.tickets }}"
-          BASE_TITLE="Merge dev to main"
-
           if [ -n "$TICKETS" ]; then
-            TITLE="$BASE_TITLE ($TICKETS)"
+            TITLE="$BASE ($TICKETS)"
             BODY=$'Triggered by a merge in dev.\nIncludes tickets: '"$TICKETS"
           else
-            TITLE="$BASE_TITLE"
+            TITLE="$BASE"
             BODY="Triggered by a merge in dev. No BOS tickets detected."
           fi
 
           # GitHub title limit: 256 chars
-          MAX_TITLE=256
           TRUNCATED="false"
           COMMENT_BODY=""
-
-          if [ ${#TITLE} -gt $MAX_TITLE ]; then
+          if [ ${#TITLE} -gt 256 ]; then
             TRUNCATED="true"
-            KEEP=$(( MAX_TITLE - 3 ))
-            TITLE="${TITLE:0:$KEEP}..."
+            TITLE="${TITLE:0:253}..."
             if [ -n "$TICKETS" ]; then
               COMMENT_BODY=$'⚠️ Full ticket list exceeded title limit.\n\n**All tickets:**\n'"$TICKETS"
             fi
           fi
 
-          # Simple scalars as key=value
-          {
-            echo "truncated=$TRUNCATED"
-            echo "title=$TITLE"
-          } >> "$GITHUB_OUTPUT"
-
-          # Multiline fields via heredoc
+          echo "title=$TITLE" >> "$GITHUB_OUTPUT"
+          echo "truncated=$TRUNCATED" >> "$GITHUB_OUTPUT"
           {
             echo 'body<<EOF'
             echo "$BODY"
             echo 'EOF'
           } >> "$GITHUB_OUTPUT"
-
           {
             echo 'comment_body<<EOF'
             echo "$COMMENT_BODY"
             echo 'EOF'
           } >> "$GITHUB_OUTPUT"
-      - name: Preview (dry run)
-        if: inputs.dry_run == true
-        run: |
-          echo "::notice title=PR Title::${{ steps.compose.outputs.title }}"
-          echo "::notice title=PR Body::${{ steps.compose.outputs.body }}"
-          if [ "${{ steps.compose.outputs.truncated }}" = "true" ]; then
-            echo "::notice title=PR Comment (full ticket list)::${{ steps.compose.outputs.comment_body }}"
-          fi
 
-      - name: Check for existing dev→main PR
-        if: inputs.dry_run != true
-        id: check_pr
+      - name: Find existing dev→main PR
+        id: pr
         env:
-          GH_TOKEN: ${{ secrets.GH_PAT }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           NUM=$(gh pr list --base main --head dev --json number --jq '.[0].number // empty')
           echo "number=$NUM" >> "$GITHUB_OUTPUT"
 
-      - name: Create PR (if none exists)
-        if: inputs.dry_run != true && steps.check_pr.outputs.number == ''
+      - name: Create PR if none exists
+        if: steps.pr.outputs.number == ''
         env:
-          GH_TOKEN: ${{ secrets.GH_PAT }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           gh pr create \
             --base main \
@@ -141,31 +109,23 @@ jobs:
             --title "${{ steps.compose.outputs.title }}" \
             --body  "${{ steps.compose.outputs.body }}"
 
-          # If we truncated, add the full ticket list as a comment
           if [ "${{ steps.compose.outputs.truncated }}" = "true" ] && [ -n "${{ steps.compose.outputs.comment_body }}" ]; then
             PR_NUMBER=$(gh pr list --base main --head dev --json number --jq '.[0].number')
             gh pr comment "$PR_NUMBER" --body "${{ steps.compose.outputs.comment_body }}"
           fi
 
-      - name: Update existing PR title (and comment if truncated)
-        if: inputs.dry_run != true && steps.check_pr.outputs.number != ''
+      - name: Update PR title (and post comment if truncated)
+        if: steps.pr.outputs.number != ''
         env:
-          GH_TOKEN: ${{ secrets.GH_PAT }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          PR_NUMBER="${{ steps.check_pr.outputs.number }}"
-          CURRENT_TITLE=$(gh pr view "$PR_NUMBER" --json title --jq '.title')
-          NEW_TITLE="${{ steps.compose.outputs.title }}"
-
-          if [ "$CURRENT_TITLE" != "$NEW_TITLE" ]; then
-            gh pr edit "$PR_NUMBER" --title "$NEW_TITLE"
+          PR="${{ steps.pr.outputs.number }}"
+          CUR=$(gh pr view "$PR" --json title --jq '.title')
+          NEW="${{ steps.compose.outputs.title }}"
+          if [ "$CUR" != "$NEW" ]; then
+            gh pr edit "$PR" --title "$NEW"
           fi
 
-          # If truncated, ensure the full list is visible in comments
           if [ "${{ steps.compose.outputs.truncated }}" = "true" ] && [ -n "${{ steps.compose.outputs.comment_body }}" ]; then
-            # Optional: avoid duplicate comments by checking recent comments.
-            # For simplicity we always post; uncomment below to be fancy.
-            # EXISTS=$(gh pr view "$PR_NUMBER" --json comments --jq '.comments[].body | select(contains("Full ticket list exceeded title limit"))' | wc -l)
-            # if [ "$EXISTS" -eq 0 ]; then
-            gh pr comment "$PR_NUMBER" --body "${{ steps.compose.outputs.comment_body }}"
-            # fi
+            gh pr comment "$PR" --body "${{ steps.compose.outputs.comment_body }}"
           fi
