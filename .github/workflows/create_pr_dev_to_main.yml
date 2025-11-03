@@ -37,23 +37,38 @@ jobs:
         id: extract
         shell: bash
         run: |
-          # Commits that exist on dev but not yet on main
+          set -o errexit
+          set -o nounset
+          set -o pipefail
+
+          # Commits on dev but not on main
           COMMITS=$(git log origin/main..origin/dev --pretty=format:"%s")
 
-          # Extract BOS tickets (case-insensitive), normalize, dedupe, join
-          TICKETS=$(echo "$COMMITS" \
-            | grep -oiE "bos[-_][0-9]+" || true \
+          # Extract, normalize, dedupe, join
+          TICKETS=$(
+            echo "$COMMITS" \
+            | (grep -oiE 'bos[-_][0-9]+' || true) \
             | tr '[:lower:]' '[:upper:]' \
             | sed 's/_/-/g' \
             | sort -u \
-            | paste -sd "," -)
+            | paste -sd ',' -
+          )
 
-          echo "tickets=$TICKETS" >> "$GITHUB_OUTPUT"
+          # Use heredoc to be robust even if empty or contains odd chars
+          {
+            echo 'tickets<<EOF'
+            echo "$TICKETS"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
 
       - name: Build PR title/body and handle title limit
         id: compose
         shell: bash
         run: |
+          set -o errexit
+          set -o nounset
+          set -o pipefail
+
           TICKETS="${{ steps.extract.outputs.tickets }}"
           BASE_TITLE="Merge dev to main"
 
@@ -61,52 +76,42 @@ jobs:
             TITLE="$BASE_TITLE ($TICKETS)"
             BODY=$'Triggered by a merge in dev.\nIncludes tickets: '"$TICKETS"
           else
-            # Keep title clean when no tickets found
             TITLE="$BASE_TITLE"
             BODY="Triggered by a merge in dev. No BOS tickets detected."
           fi
 
-          # GitHub title limit: 256 chars (use 256 exact)
+          # GitHub title limit: 256 chars
           MAX_TITLE=256
           TRUNCATED="false"
           COMMENT_BODY=""
 
           if [ ${#TITLE} -gt $MAX_TITLE ]; then
             TRUNCATED="true"
-            # leave some room for ellipsis; safe cut
-            # keep the prefix and an abbreviated ticket list
             KEEP=$(( MAX_TITLE - 3 ))
-            SHORT_TITLE="${TITLE:0:$KEEP}..."
-            TITLE="$SHORT_TITLE"
+            TITLE="${TITLE:0:$KEEP}..."
             if [ -n "$TICKETS" ]; then
               COMMENT_BODY=$'⚠️ Full ticket list exceeded title limit.\n\n**All tickets:**\n'"$TICKETS"
             fi
           fi
 
-          # Emit outputs
+          # Simple scalars as key=value
           {
-            echo "title=$TITLE"
             echo "truncated=$TRUNCATED"
+            echo "title=$TITLE"
           } >> "$GITHUB_OUTPUT"
 
-          # Multiline body
+          # Multiline fields via heredoc
           {
-            echo "body<<EOF"
+            echo 'body<<EOF'
             echo "$BODY"
-            echo "EOF"
+            echo 'EOF'
           } >> "$GITHUB_OUTPUT"
 
-          # Multiline optional comment
-          if [ -n "$COMMENT_BODY" ]; then
-            {
-              echo "comment_body<<EOF"
-              echo "$COMMENT_BODY"
-              echo "EOF"
-            } >> "$GITHUB_OUTPUT"
-          else
-            echo "comment_body=" >> "$GITHUB_OUTPUT"
-          fi
-
+          {
+            echo 'comment_body<<EOF'
+            echo "$COMMENT_BODY"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
       - name: Preview (dry run)
         if: inputs.dry_run == true
         run: |
